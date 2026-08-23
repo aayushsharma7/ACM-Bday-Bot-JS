@@ -8,9 +8,10 @@ import ping from './commands/ping.js';
 import upcoming from './commands/upcoming.js';
 import help from './commands/help.js';
 import verify from "./commands/verify.js";
+import togglecounter from "./commands/togglecounter.js"; // NEW
 
 
-const commands = [ setbday.data.toJSON(),updatebday.data.toJSON(), checkbday.data.toJSON(), deletebday.data.toJSON(), ping.data.toJSON(), upcoming.data.toJSON(), help.data.toJSON(), verify.data.toJSON() ];
+const commands = [ setbday.data.toJSON(),updatebday.data.toJSON(), checkbday.data.toJSON(), deletebday.data.toJSON(), ping.data.toJSON(), upcoming.data.toJSON(), help.data.toJSON(), verify.data.toJSON(), togglecounter.data.toJSON() ]; // CHANGED: added togglecounter
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 

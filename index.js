@@ -15,6 +15,9 @@ import { Partials, ChannelType } from "discord.js"; // Updated to include Partia
 import nodemailer from "nodemailer";
 import { Verify } from "./models/verify.model.js";
 import verify from "./commands/verify.js";
+import { BranchStat } from "./models/branchstat.model.js"; // NEW: per-branch verification counts
+import { getSettings } from "./models/settings.model.js"; // NEW: counter toggle + stats message tracking
+import togglecounter from "./commands/togglecounter.js"; // NEW: admin toggle command
 const connectDB = async () => {
     try {
         await mongoose.connect(`${process.env.MONGO_URI}`);
@@ -141,6 +144,8 @@ client.on(Events.InteractionCreate, async interaction => {
             await help.execute(interaction);
         } else if (interaction.commandName === 'verify') {
             await verify.execute(interaction);
+        } else if (interaction.commandName === 'togglecounter') { // NEW
+            await togglecounter.execute(interaction);
         }
     } catch (error) {
         console.error(`Error executing ${interaction.commandName}:`, error);
@@ -170,6 +175,8 @@ const OTP_EXPIRY_MINUTES = 15;
 const MAX_OTP_ATTEMPTS = 5;
 const RESEND_COOLDOWN_SECONDS = 60;
 const EMAIL_REGEX = /^[a-zA-Z0-9._%+-]+@pec\.edu\.in$/; // stricter than endsWith: blocks "@pec.edu.in" with no name part
+const JOIN_LOG_CHANNEL_ID = '1032522552804909109'; // verification logs go here
+const STATS_CHANNEL_ID = '1541058656752373760'; // NEW: branch counter leaderboard goes here
 
 const COLORS = {
     ERROR: 0xED4245,
@@ -184,13 +191,120 @@ const DISCORD_ERROR_HINTS = {
     50001: "I'm missing access to perform that action in this server.",
 };
 
-function buildEmbed({ title, description, color = COLORS.INFO }) {
-    return new EmbedBuilder()
+// CHANGED: added `author` (avatar + name, for the log-style embeds) and
+// `footerText` (defaults to the old static text so every existing call site
+// that doesn't pass it keeps behaving exactly as before)
+function buildEmbed({ title, description, color = COLORS.INFO, fields = [], author = null, footerText = 'Verification System' }) {
+    const embed = new EmbedBuilder()
         .setTitle(title)
         .setDescription(description)
         .setColor(color)
-        .setFooter({ text: 'Verification System' })
+        .setFooter({ text: footerText })
         .setTimestamp();
+    if (fields.length) embed.addFields(fields);
+    if (author) embed.setAuthor({ name: author.name, iconURL: author.iconURL }); // NEW
+    return embed;
+}
+
+// sends a log embed to #join-log. Channel is fetched once and cached;
+// if the fetch/send ever fails, the cache is cleared so the next call retries.
+let logChannelCache = null;
+async function sendLog(embed) {
+    try {
+        if (!logChannelCache) {
+            logChannelCache = await client.channels.fetch(JOIN_LOG_CHANNEL_ID);
+        }
+        if (logChannelCache) await logChannelCache.send({ embeds: [embed] });
+    } catch (err) {
+        console.error('Failed to send verification log:', err);
+        logChannelCache = null;
+    }
+}
+
+// ==========================================
+// BRANCH COUNTER SYSTEM
+// ==========================================
+// Maps a lowercase branch code (parsed from the email) to its full name for
+// display. A code with no entry here still works fine — it just renders as
+// the raw uppercased code with no expansion.
+// const BRANCH_NAMES = {
+//     cse: 'Computer Science & Engineering',
+//     ece: 'Electronics & Communication Engineering',
+//     ee: 'Electrical Engineering',
+//     me: 'Mechanical Engineering',
+//     ce: 'Civil Engineering',
+//     it: 'Information Technology',
+//     pie: 'Production & Industrial Engineering',
+//     mme: 'Materials & Metallurgical Engineering',
+//     ae: 'Aerospace Engineering',
+//     aero: 'Aerospace Engineering',
+//     unknown: 'Unrecognized / Other',
+// };
+
+// College email local-parts look like "rahulsharma.bt23ece" — a 2-digit
+// admission year immediately followed by the branch code (letters only, any
+// length) right before the "@". Returns the lowercase branch code, or null
+// if that shape isn't found in the local part.
+function parseBranch(email) {
+    const localPart = email.split('@')[0];
+    const match = localPart.match(/\d{2}([a-zA-Z]+)$/);
+    return match ? match[1].toLowerCase() : null;
+}
+
+// Atomic upsert-increment — safe even if two verifications land at the exact
+// same instant, since Mongo does the +1 server-side rather than us
+// read-modify-writing a count in JS.
+async function incrementBranchCount(branch) {
+    await BranchStat.findOneAndUpdate(
+        { branch },
+        { $inc: { count: 1 } },
+        { upsert: true }
+    );
+}
+
+function formatBranchLabel(branch) {
+    
+    return branch
+}
+
+// Rebuilds and reposts the #stats leaderboard, deleting the previous message
+// first so the channel only ever holds one, current snapshot.
+// Note: if two verifications finish at the exact same moment there's a small
+// race window (the second repost could delete the message the first one just
+// posted) — acceptable at this scale, not worth a distributed lock for a
+// college server bot.
+async function postStatsEmbed() {
+    try {
+        const stats = await BranchStat.find().sort({ count: -1 });
+        const total = stats.reduce((sum, s) => sum + s.count, 0);
+
+        const lines = stats.length
+            ? stats.map(s => `**${formatBranchLabel(s.branch)}** — ${s.count}`).join('\n')
+            : 'No verifications recorded yet.';
+
+        const embed = new EmbedBuilder()
+            .setTitle('Verified Members by Branch')
+            .setDescription(`**Total Verified:** ${total}\n\n${lines}`)
+            .setColor(COLORS.INFO)
+            .setFooter({ text: 'Branch Counter' })
+            .setTimestamp();
+
+        const channel = await client.channels.fetch(STATS_CHANNEL_ID);
+        if (!channel) return;
+
+        const settings = await getSettings();
+
+        if (settings.statsMessageId) {
+            const oldMessage = await channel.messages.fetch(settings.statsMessageId).catch(() => null);
+            if (oldMessage) await oldMessage.delete().catch(() => {});
+        }
+
+        const newMessage = await channel.send({ embeds: [embed] });
+        settings.statsMessageId = newMessage.id;
+        await settings.save();
+    } catch (err) {
+        console.error('Failed to update the branch stats embed:', err);
+    }
 }
 
 function generateOtp() {
@@ -239,7 +353,7 @@ client.on(Events.GuildMemberAdd, async (member) => {
             step: 'AWAITING_EMAIL'
         });
 
-        // NEW: Restrict access immediately by giving them the unverified role
+        // Restrict access immediately by giving them the unverified role
         if (process.env.UNVERIFIED_ROLE_ID) {
             await member.roles.add(process.env.UNVERIFIED_ROLE_ID).catch(err => {
                 console.error("Could not add unverified role:", err);
@@ -255,6 +369,17 @@ client.on(Events.GuildMemberAdd, async (member) => {
         });
     } catch (error) {
         console.error(`Failed to DM new member ${member.user.tag}. DMs might be disabled.`, error);
+        // CHANGED: professional log embed — author block instead of emoji title, ID moved to footer
+        await sendLog(buildEmbed({
+            title: 'Welcome DM Failed',
+            description: 'Could not DM this member on join — they likely have server DMs disabled, so verification never started.',
+            color: COLORS.ERROR,
+            author: { name: member.user.tag, iconURL: member.user.displayAvatarURL() },
+            fields: [
+                { name: 'Member', value: `<@${member.id}>` },
+            ],
+            footerText: `ID: ${member.id}`,
+        }));
     }
 });
 
@@ -268,7 +393,7 @@ client.on(Events.MessageCreate, async (message) => {
     const userInput = message.content.trim();
 
     try {
-        // NEW: Show "typing..." immediately so it doesn't look like the bot is stuck
+        // Show "typing..." immediately so it doesn't look like the bot is stuck
         await message.channel.sendTyping().catch(() => {});
 
         // Cancel / restart works at any step
@@ -312,7 +437,7 @@ client.on(Events.MessageCreate, async (message) => {
 
             const otp = generateOtp();
 
-            // NEW: Refresh the typing indicator right before the slow network call
+            // Refresh the typing indicator right before the slow network call
             await message.channel.sendTyping().catch(() => {});
 
             try {
@@ -336,6 +461,19 @@ client.on(Events.MessageCreate, async (message) => {
                 });
             } catch (err) {
                 console.error("Email send failed:", err);
+                // CHANGED: professional log embed
+                await sendLog(buildEmbed({
+                    title: 'Email Delivery Failed',
+                    description: 'Failed to send the initial verification code.',
+                    color: COLORS.ERROR,
+                    author: { name: message.author.tag, iconURL: message.author.displayAvatarURL() },
+                    fields: [
+                        { name: 'Member', value: `<@${message.author.id}>` },
+                        { name: 'Attempted Email', value: `\`${email}\`` },
+                        { name: 'Error', value: `\`${(err.message || 'Unknown error').slice(0, 200)}\`` },
+                    ],
+                    footerText: `ID: ${message.author.id}`,
+                }));
                 return message.reply({
                     embeds: [buildEmbed({
                         title: "⚠️ Couldn't Send Email",
@@ -374,7 +512,7 @@ client.on(Events.MessageCreate, async (message) => {
                 }
 
                 const otp = generateOtp();
-                // NEW: Refresh the typing indicator right before the slow network call
+                // Refresh the typing indicator right before the slow network call
                 await message.channel.sendTyping().catch(() => {});
 
                 try {
@@ -393,6 +531,19 @@ client.on(Events.MessageCreate, async (message) => {
                     });
                 } catch (err) {
                     console.error("Resend failed:", err);
+                    // CHANGED: professional log embed
+                    await sendLog(buildEmbed({
+                        title: 'Email Resend Failed',
+                        description: 'Failed to resend the verification code.',
+                        color: COLORS.ERROR,
+                        author: { name: message.author.tag, iconURL: message.author.displayAvatarURL() },
+                        fields: [
+                            { name: 'Member', value: `<@${message.author.id}>` },
+                            { name: 'Email', value: `\`${session.email}\`` },
+                            { name: 'Error', value: `\`${(err.message || 'Unknown error').slice(0, 200)}\`` },
+                        ],
+                        footerText: `ID: ${message.author.id}`,
+                    }));
                     return message.reply({
                         embeds: [buildEmbed({
                             title: "⚠️ Couldn't Resend",
@@ -419,6 +570,18 @@ client.on(Events.MessageCreate, async (message) => {
 
                 if (session.otpAttempts >= MAX_OTP_ATTEMPTS) {
                     await Verify.findOneAndDelete({ userId: message.author.id });
+                    // CHANGED: professional log embed
+                    await sendLog(buildEmbed({
+                        title: 'Verification Lockout',
+                        description: 'Exceeded the maximum OTP attempts and was locked out.',
+                        color: COLORS.ERROR,
+                        author: { name: message.author.tag, iconURL: message.author.displayAvatarURL() },
+                        fields: [
+                            { name: 'Member', value: `<@${message.author.id}>` },
+                            { name: 'Email', value: session.email ? `\`${session.email}\`` : 'N/A' },
+                        ],
+                        footerText: `ID: ${message.author.id}`,
+                    }));
                     return message.reply({
                         embeds: [buildEmbed({
                             title: '🔒 Too Many Attempts',
@@ -442,6 +605,18 @@ client.on(Events.MessageCreate, async (message) => {
             // OTP is correct — assign roles
             if (!process.env.VERIFIED_ROLE_ID) {
                 console.error('VERIFIED_ROLE_ID is not set in environment variables.');
+                // CHANGED: professional log embed
+                await sendLog(buildEmbed({
+                    title: 'Configuration Error',
+                    description: `Completed OTP verification, but \`VERIFIED_ROLE_ID\` is not set. No role could be assigned.`,
+                    color: COLORS.ERROR,
+                    author: { name: message.author.tag, iconURL: message.author.displayAvatarURL() },
+                    fields: [
+                        { name: 'Member', value: `<@${message.author.id}>` },
+                        { name: 'Email', value: `\`${session.email}\`` },
+                    ],
+                    footerText: `ID: ${message.author.id}`,
+                }));
                 return message.reply({
                     embeds: [buildEmbed({
                         title: '⚠️ Configuration Error',
@@ -452,7 +627,7 @@ client.on(Events.MessageCreate, async (message) => {
             }
 
             try {
-                // NEW: Refresh the typing indicator before the guild/member fetch + role calls
+                // Refresh the typing indicator before the guild/member fetch + role calls
                 await message.channel.sendTyping().catch(() => {});
 
                 // OTP is correct, fetch the guild and member
@@ -469,6 +644,8 @@ client.on(Events.MessageCreate, async (message) => {
                     });
                 }
 
+                const verifiedEmail = session.email; // captured before session is deleted, for the log/counter
+
                 // Cleanup the DB record
                 await Verify.findOneAndDelete({ userId: message.author.id });
 
@@ -479,6 +656,36 @@ client.on(Events.MessageCreate, async (message) => {
                         color: COLORS.SUCCESS,
                     })]
                 });
+
+                // NEW: branch counter — parse the branch from the verified email,
+                // fall back to an "unknown" bucket if the shape doesn't match.
+                // The whole counter (increment + #stats repost) is skipped while
+                // toggled off via /togglecounter, but the branch is still shown
+                // in the log either way so admins can see what *would* have
+                // been counted.
+                const branchCode = parseBranch(verifiedEmail);
+                const bucket = branchCode || 'unknown';
+                const settings = await getSettings();
+
+                if (settings.branchCounterEnabled) {
+                    await incrementBranchCount(bucket);
+                    await postStatsEmbed();
+                }
+
+                await sendLog(buildEmbed({
+                    title: branchCode ? 'Member Verified' : 'Member Verified — Branch Unrecognized',
+                    description: branchCode
+                        ? 'Successfully verified and granted access.'
+                        : 'Successfully verified and granted access, but the branch code could not be parsed from the email — counted under Unknown.',
+                    color: branchCode ? COLORS.SUCCESS : COLORS.WARNING,
+                    author: { name: member.user.tag, iconURL: member.user.displayAvatarURL() },
+                    fields: [
+                        { name: 'Member', value: `<@${member.id}>` },
+                        { name: 'Email', value: `\`${verifiedEmail}\`` },
+                        ...(settings.branchCounterEnabled ? [] : [{ name: 'Counter', value: 'Not counted — branch counter is currently disabled' }]),
+                    ],
+                    footerText: `ID: ${member.id}`,
+                }));
             } catch (err) {
                 console.error("Role Assignment Error:", err);
 
@@ -495,6 +702,19 @@ client.on(Events.MessageCreate, async (message) => {
                 }
 
                 const hint = DISCORD_ERROR_HINTS[err.code];
+                // CHANGED: professional log embed
+                await sendLog(buildEmbed({
+                    title: 'Role Assignment Failed',
+                    description: `Entered the correct code, but roles could not be updated.`,
+                    color: COLORS.ERROR,
+                    author: { name: message.author.tag, iconURL: message.author.displayAvatarURL() },
+                    fields: [
+                        { name: 'Member', value: `<@${message.author.id}>` },
+                        { name: 'Email', value: `\`${session.email}\`` },
+                        { name: 'Error Code', value: `\`${err.code || 'Unknown'}\`` },
+                    ],
+                    footerText: `ID: ${message.author.id}`,
+                }));
                 // Deliberately NOT deleting the session here — the OTP was correct,
                 // so the user can just message again once the role issue (e.g. bot
                 // permissions) is fixed, instead of restarting from scratch.
@@ -509,6 +729,18 @@ client.on(Events.MessageCreate, async (message) => {
         }
     } catch (outerErr) {
         console.error('Unhandled verification error:', outerErr);
+        // CHANGED: professional log embed
+        sendLog(buildEmbed({
+            title: 'Unexpected Verification Error',
+            description: `An unhandled error occurred while processing a DM from this member.`,
+            color: COLORS.ERROR,
+            author: { name: message.author.tag, iconURL: message.author.displayAvatarURL() },
+            fields: [
+                { name: 'Member', value: `<@${message.author.id}>` },
+                { name: 'Error', value: `\`${(outerErr.message || 'Unknown error').slice(0, 200)}\`` },
+            ],
+            footerText: `ID: ${message.author.id}`,
+        })).catch(() => {});
         message.reply({
             embeds: [buildEmbed({
                 title: '⚠️ Unexpected Error',
